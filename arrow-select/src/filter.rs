@@ -254,6 +254,44 @@ impl FilterBuilder {
     }
 }
 
+pub struct SplitBuilder {
+    filter_builder: FilterBuilder,
+}
+
+impl SplitBuilder {
+    /// Create a new [`SplitBuilder`] that can be used to construct a [`SplitPredicate`]
+    pub fn new(split: &BooleanArray) -> Self {
+        let mut builder = FilterBuilder::new(split);
+        if let IterationStrategy::IndexIterator = builder.strategy {
+            builder.strategy = IterationStrategy::SlicesIterator;
+        }
+
+        Self {
+            filter_builder: builder,
+        }
+    }
+
+    /// Compute an optimised representation of the provided `split` mask that can be
+    /// applied to an array more quickly.
+    ///
+    /// Note: There is limited benefit to calling this to then filter a single array
+    /// Note: This will likely have a larger memory footprint than the original mask
+    pub fn optimize(mut self) -> Self {
+        Self {
+            filter_builder: self.filter_builder.optimize(),
+        }
+    }
+
+    /// Construct the final `FilterPredicate`
+    pub fn build(self) -> SplitPredicate {
+        SplitPredicate {
+            filter: self.filter_builder.filter,
+            l_count: self.filter_builder.count,
+            strategy: self.filter_builder.strategy,
+        }
+    }
+}
+
 /// The iteration strategy used to evaluate [`FilterPredicate`]
 #[derive(Debug)]
 enum IterationStrategy {
@@ -892,6 +930,277 @@ fn filter_sparse_union(
     Ok(unsafe {
         UnionArray::new_unchecked(fields.clone(), type_ids.into_parts().1, None, children)
     })
+}
+
+/// A filtering predicate that can be applied to an [`Array`]
+#[derive(Debug)]
+pub struct SplitPredicate {
+    filter: BooleanArray,
+    l_count: usize,
+    strategy: IterationStrategy,
+}
+
+struct SplitState<'a> {
+    split: &'a SplitPredicate,
+    r_count: usize,
+}
+
+impl SplitPredicate {
+    /// Selects rows from `values` based on this [`FilterPredicate`]
+    pub fn split(&self, values: &dyn Array) -> Result<(ArrayRef, ArrayRef), ArrowError> {
+        let state = SplitState {
+            split: self,
+            r_count: values.len() - self.l_count,
+        };
+        split_array(values, &state)
+    }
+
+    pub fn split_record_batch(
+        &self,
+        record_batch: &RecordBatch,
+    ) -> Result<(RecordBatch, RecordBatch), ArrowError> {
+        let state = SplitState {
+            split: self,
+            r_count: record_batch.num_rows() - self.l_count,
+        };
+
+        let split_arrays = record_batch
+            .columns()
+            .iter()
+            .map(|a| split_array(a, &state))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let (left, right) = split_arrays.into_iter().unzip();
+
+        // SAFETY: we know that the set of filtered arrays will match the schema of the original
+        // record batch
+        unsafe {
+            Ok((
+                RecordBatch::new_unchecked(record_batch.schema(), left, self.l_count),
+                RecordBatch::new_unchecked(
+                    record_batch.schema(),
+                    right,
+                    record_batch.num_rows() - state.r_count,
+                ),
+            ))
+        }
+    }
+}
+
+fn split_array(
+    values: &dyn Array,
+    predicate: &SplitState,
+) -> Result<(ArrayRef, ArrayRef), ArrowError> {
+    if predicate.split.filter.len() > values.len() {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "Filter predicate of length {} is larger than target array of length {}",
+            predicate.split.filter.len(),
+            values.len()
+        )));
+    }
+
+    match predicate.split.strategy {
+        IterationStrategy::None => Ok((
+            new_empty_array(values.data_type()),
+            values.slice(0, predicate.r_count),
+        )),
+        IterationStrategy::All => Ok((
+            values.slice(0, predicate.split.l_count),
+            new_empty_array(values.data_type()),
+        )),
+        // actually filter
+        _ => downcast_primitive_array! {
+            values => {
+                let (l, r) = split_primitive(values, predicate);
+                Ok((Arc::new(l), Arc::new(r)))
+            },
+            DataType::Boolean => {
+                let values = values.as_any().downcast_ref::<BooleanArray>().unwrap();
+                let (l, r) = split_boolean(values, predicate);
+                Ok((Arc::new(l), Arc::new(r)))
+            }
+            _ => {
+                todo!("split not implemented for {:?}", values.data_type())
+            }
+        },
+    }
+}
+
+fn split_null_mask(
+    nulls: Option<&NullBuffer>,
+    predicate: &SplitState,
+) -> (Option<(usize, Buffer)>, Option<(usize, Buffer)>) {
+    let Some(nulls) = nulls else {
+        return (None, None);
+    };
+
+    if nulls.null_count() == 0 {
+        return (None, None);
+    }
+
+    let (l_nulls, r_nulls) = split_bits(nulls.inner(), predicate);
+    // The filtered `nulls` has a length of `predicate.count` bits and
+    // therefore the null count is this minus the number of valid bits
+    let l_null_count = predicate.split.l_count - l_nulls.count_set_bits_offset(0, predicate.split.l_count);
+    let l = if l_null_count == 0 {
+        None
+    } else {
+        Some((l_null_count, l_nulls))
+    };
+
+    let r_null_count = predicate.r_count - r_nulls.count_set_bits_offset(0, predicate.r_count);
+    let r = if r_null_count == 0 {
+        None
+    } else {
+        Some((r_null_count, r_nulls))
+    };
+
+    (l, r)
+}
+
+fn split_bits(buffer: &BooleanBuffer, predicate: &SplitState) -> (Buffer, Buffer) {
+    let src = buffer.values();
+    let offset = buffer.offset();
+
+    match &predicate.split.strategy {
+        IterationStrategy::SlicesIterator => {
+            let mut l_builder = BooleanBufferBuilder::new(predicate.split.l_count);
+            let mut r_builder = BooleanBufferBuilder::new(predicate.r_count);
+            let mut last_l = 0;
+            for (start, end) in SlicesIterator::new(&predicate.split.filter) {
+                if start > last_l {
+                    r_builder.append_packed_range(last_l + offset..start + offset, src);
+                }
+                l_builder.append_packed_range(start + offset..end + offset, src);
+                last_l = end;
+            }
+            if last_l < buffer.len() {
+                r_builder.append_packed_range(last_l + offset..buffer.len() + offset, src);
+            }
+            (l_builder.into(), r_builder.into())
+        }
+        IterationStrategy::Slices(slices) => {
+            let mut l_builder = BooleanBufferBuilder::new(predicate.split.l_count);
+            let mut r_builder = BooleanBufferBuilder::new(predicate.r_count);
+            let mut last_l = 0;
+            for (start, end) in slices {
+                if *start > last_l {
+                    r_builder.append_packed_range(last_l + offset..*start + offset, src);
+                }
+                l_builder.append_packed_range(*start + offset..*end + offset, src);
+                last_l = *end;
+            }
+            if last_l < buffer.len() {
+                r_builder.append_packed_range(last_l + offset..buffer.len() + offset, src);
+            }
+            (l_builder.into(), r_builder.into())
+        }
+        IterationStrategy::IndexIterator
+        | IterationStrategy::Indices(_)
+        | IterationStrategy::All
+        | IterationStrategy::None => unreachable!(),
+    }
+}
+
+fn split_boolean(array: &BooleanArray, predicate: &SplitState) -> (BooleanArray, BooleanArray) {
+    let (l_values, r_values) = split_bits(array.values(), predicate);
+
+    let mut l_builder = ArrayDataBuilder::new(DataType::Boolean)
+        .len(predicate.split.l_count)
+        .add_buffer(l_values);
+
+    let mut r_builder = ArrayDataBuilder::new(DataType::Boolean)
+        .len(predicate.r_count)
+        .add_buffer(r_values);
+
+    let (l_nulls, r_nulls) = split_null_mask(array.nulls(), predicate);
+
+    if let Some((null_count, nulls)) = l_nulls {
+        l_builder = l_builder.null_count(null_count).null_bit_buffer(Some(nulls));
+    }
+
+    if let Some((null_count, nulls)) = r_nulls {
+        r_builder = r_builder.null_count(null_count).null_bit_buffer(Some(nulls));
+    }
+
+    let l_data = unsafe { l_builder.build_unchecked() };
+    let r_data = unsafe { r_builder.build_unchecked() };
+    (BooleanArray::from(l_data), BooleanArray::from(r_data))
+}
+
+#[inline(never)]
+fn split_native<T: ArrowNativeType>(values: &[T], predicate: &SplitState) -> (Buffer, Buffer) {
+    assert!(values.len() >= predicate.split.filter.len());
+
+    match &predicate.split.strategy {
+        IterationStrategy::SlicesIterator => {
+            let mut l_buffer = Vec::with_capacity(predicate.split.l_count);
+            let mut r_buffer = Vec::with_capacity(predicate.r_count);
+            let mut last_l = 0;
+            for (start, end) in SlicesIterator::new(&predicate.split.filter) {
+                if start > last_l {
+                    r_buffer.extend_from_slice(&values[last_l..start]);
+                }
+                l_buffer.extend_from_slice(&values[start..end]);
+                last_l = end;
+            }
+            if last_l < values.len() {
+                r_buffer.extend_from_slice(&values[last_l..values.len()]);
+            }
+            (l_buffer.into(), r_buffer.into())
+        }
+        IterationStrategy::Slices(slices) => {
+            let mut l_buffer = Vec::with_capacity(predicate.split.l_count);
+            let mut r_buffer = Vec::with_capacity(predicate.r_count);
+            let mut last_l = 0;
+            for (start, end) in slices {
+                if *start > last_l {
+                    r_buffer.extend_from_slice(&values[last_l..*start]);
+                }
+                l_buffer.extend_from_slice(&values[*start..*end]);
+                last_l = *end;
+            }
+            if last_l < values.len() {
+                r_buffer.extend_from_slice(&values[last_l..values.len()]);
+            }
+            (l_buffer.into(), r_buffer.into())
+        }
+        IterationStrategy::IndexIterator | IterationStrategy::Indices(_) | IterationStrategy::All | IterationStrategy::None => unreachable!(),
+    }
+}
+
+fn split_primitive<T>(
+    array: &PrimitiveArray<T>,
+    predicate: &SplitState,
+) -> (PrimitiveArray<T>, PrimitiveArray<T>)
+where
+    T: ArrowPrimitiveType,
+{
+    let values = array.values();
+    let (l_buffer, r_buffer) = split_native(values, predicate);
+    let mut l_builder = ArrayDataBuilder::new(array.data_type().clone())
+        .len(predicate.split.l_count)
+        .add_buffer(l_buffer);
+    let mut r_builder = ArrayDataBuilder::new(array.data_type().clone())
+        .len(predicate.r_count)
+        .add_buffer(r_buffer);
+
+    let (l_null, r_null) = split_null_mask(array.nulls(), predicate);
+    if let Some((null_count, nulls)) = l_null {
+        l_builder = l_builder
+            .null_count(null_count)
+            .null_bit_buffer(Some(nulls));
+    }
+
+    if let Some((null_count, nulls)) = r_null {
+        r_builder = r_builder
+            .null_count(null_count)
+            .null_bit_buffer(Some(nulls));
+    }
+
+    let l_data = unsafe { l_builder.build_unchecked() };
+    let r_data = unsafe { r_builder.build_unchecked() };
+    (PrimitiveArray::from(l_data), PrimitiveArray::from(r_data))
 }
 
 #[cfg(test)]
